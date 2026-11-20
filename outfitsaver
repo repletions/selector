@@ -1,0 +1,805 @@
+local workspace = game:GetService("Workspace")
+local players = game:GetService("Players")
+local coregui = game:GetService("CoreGui")
+local runservice = game:GetService("RunService")
+local uis = game:GetService("UserInputService")
+local repstorage = game:GetService("ReplicatedStorage")
+
+local lp = players.LocalPlayer
+local mouse = lp:GetMouse()
+
+-- state
+local state = {
+    clickmode = false,
+    renderdist = 150,
+    culling = false,
+    selected = {},
+    highlights = {},
+    exporting = false
+}
+
+-- core visual
+local hovercolor = Color3.fromRGB(255, 255, 255)
+local selectcolor = Color3.fromRGB(0, 255, 0)
+
+-- ============================================================================
+-- utils e funcoes base
+-- ============================================================================
+
+local function isrig(obj)
+    if not obj then return false end
+    if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
+        if obj == lp.Character then return false end
+        return true
+    end
+    return false
+end
+
+local function getroot(rig)
+    return rig.PrimaryPart or rig:FindFirstChild("HumanoidRootPart") or rig:FindFirstChild("Torso") or rig:FindFirstChild("UpperTorso")
+end
+
+local function applyhighlight(rig, color, transp)
+    if not rig then return end
+    
+    if state.highlights[rig] then
+        state.highlights[rig].FillColor = color
+        state.highlights[rig].FillTransparency = transp
+        return
+    end
+
+    local hl = Instance.new("Highlight")
+    hl.Name = "cac_visual"
+    hl.FillColor = color
+    hl.FillTransparency = transp
+    hl.OutlineColor = color
+    hl.OutlineTransparency = 0.2
+    hl.Adornee = rig
+    
+    local ok, err = pcall(function() hl.Parent = coregui end)
+    if not ok then hl.Parent = rig end
+    
+    state.highlights[rig] = hl
+end
+
+local function removehighlight(rig)
+    if state.highlights[rig] then
+        state.highlights[rig]:Destroy()
+        state.highlights[rig] = nil
+    end
+end
+
+local function toggleselection(rig)
+    if not rig then return end
+    if state.exporting then return end
+    
+    local found = false
+    for i, v in ipairs(state.selected) do
+        if v == rig then
+            found = i
+            break
+        end
+    end
+
+    if found then
+        table.remove(state.selected, found)
+        removehighlight(rig)
+    else
+        table.insert(state.selected, rig)
+        applyhighlight(rig, selectcolor, 0.6)
+    end
+end
+
+-- ============================================================================
+-- sistema de selecao por clique (inspector)
+-- ============================================================================
+
+local currenthover = nil
+
+runservice.RenderStepped:Connect(function()
+    if not state.clickmode then
+        if currenthover and not table.find(state.selected, currenthover) then
+            removehighlight(currenthover)
+            currenthover = nil
+        end
+        return
+    end
+
+    local target = mouse.Target
+    local newhover = nil
+
+    if target then
+        local model = target:FindFirstAncestorOfClass("Model")
+        if isrig(model) then
+            newhover = model
+        elseif isrig(target) then
+            newhover = target
+        end
+    end
+
+    if currenthover ~= newhover then
+        if currenthover and not table.find(state.selected, currenthover) then
+            removehighlight(currenthover)
+        end
+        currenthover = newhover
+        if currenthover and not table.find(state.selected, currenthover) then
+            applyhighlight(currenthover, hovercolor, 0.8)
+        end
+    end
+end)
+
+uis.InputBegan:Connect(function(input, gameprocessed)
+    if gameprocessed then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 and state.clickmode then
+        if currenthover then
+            toggleselection(currenthover)
+        end
+    end
+end)
+
+-- ============================================================================
+-- render culling profissional (batching para n travar)
+-- ============================================================================
+
+local function updateculling()
+    if not state.culling then return end
+    local char = lp.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local cam = workspace.CurrentCamera
+    local campos = cam.CFrame.Position
+
+    local allrigs = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if isrig(obj) then table.insert(allrigs, obj) end
+    end
+
+    -- processa em lotes pra nao dar frame drop
+    task.spawn(function()
+        for i, rig in ipairs(allrigs) do
+            local rigroot = getroot(rig)
+            if rigroot then
+                local dist = (campos - rigroot.Position).Magnitude
+                local isfar = dist > state.renderdist and not table.find(state.selected, rig)
+                
+                for _, part in ipairs(rig:GetDescendants()) do
+                    if part:IsA("BasePart") or part:IsA("Decal") or part:IsA("Texture") then
+                        -- localtransparencymodifier esconde visualmente sem alterar a transparencia real pro save
+                        if isfar then
+                            if part:IsA("BasePart") then part.LocalTransparencyModifier = 1 end
+                            if part:IsA("Decal") or part:IsA("Texture") then part.LocalTransparencyModifier = 1 end
+                        else
+                            if part:IsA("BasePart") then part.LocalTransparencyModifier = 0 end
+                            if part:IsA("Decal") or part:IsA("Texture") then part.LocalTransparencyModifier = 0 end
+                        end
+                    end
+                end
+            end
+            if i % 50 == 0 then task.wait() end
+        end
+    end)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        updateculling()
+    end
+end)
+
+-- ============================================================================
+-- export e engine de grid
+-- ============================================================================
+
+local function cleanrig(rig)
+    for _, obj in ipairs(rig:GetDescendants()) do
+        if obj:IsA("BaseScript") or obj:IsA("Sound") or (obj:IsA("Highlight") and obj.Name == "cac_visual") or obj:IsA("SelectionBox") then
+            obj:Destroy()
+        elseif obj:IsA("BasePart") then
+            obj.Anchored = true
+            obj.LocalTransparencyModifier = 0 -- garante que vem visivel no save
+        elseif obj:IsA("Decal") or obj:IsA("Texture") then
+            obj.LocalTransparencyModifier = 0
+        end
+    end
+end
+
+-- Clone() pula qualquer descendente com Archivable = false (SurfaceAppearance, MeshPart, Decal, acessorios...),
+-- entao eles sumiam do export. liga Archivable em tudo so durante o clone e restaura o valor original depois.
+local function clonewithdescendants(rig)
+    local changed = {}
+    local function mark(inst)
+        local okread, arch = pcall(function() return inst.Archivable end)
+        if okread and arch == false then
+            local okset = pcall(function() inst.Archivable = true end)
+            if okset then table.insert(changed, inst) end
+        end
+    end
+
+    mark(rig)
+    for _, d in ipairs(rig:GetDescendants()) do mark(d) end
+
+    local s, clone = pcall(function() return rig:Clone() end)
+
+    for _, inst in ipairs(changed) do
+        pcall(function() inst.Archivable = false end)
+    end
+    return s, clone
+end
+
+-- universal syn saveinstance (rbxlx repo). se falhar o load, cai no fallback de workspace do exportselected
+local synsaveinstance
+do
+    local Params = {
+        RepoURL = "https://raw.githubusercontent.com/rbxlx/UniversalSynSaveInstance/main/",
+        SSI = "saveinstance",
+    }
+    local okload, loaded = pcall(function()
+        return loadstring(game:HttpGet(Params.RepoURL .. Params.SSI .. ".luau", true), Params.SSI)()
+    end)
+    if okload and loaded ~= nil then synsaveinstance = loaded end
+end
+
+local function exportselected()
+    if #state.selected == 0 then return false end
+
+    local exportfolder = Instance.new("Folder")
+    exportfolder.Name = "CAC_Extraidos_" .. os.time()
+    local count = 0
+
+    for _, rig in ipairs(table.clone(state.selected)) do
+        local s, clone = clonewithdescendants(rig)
+        if not (s and clone) then
+            warn("[cac] falhou ao clonar rig: " .. tostring(rig.Name))
+        end
+
+        if s and clone then
+            count = count + 1
+            clone.Name = rig.Name .. "_CAC_" .. count
+            cleanrig(clone)
+
+            local row = math.floor((count - 1) / 10)
+            local col = (count - 1) % 10
+            
+            local cframe = CFrame.new(col * 7, 5, row * 7)
+            if clone.PrimaryPart then
+                clone:PivotTo(cframe)
+            else
+                local root = getroot(clone)
+                if root then
+                    local offset = clone:GetPivot():ToObjectSpace(root.CFrame)
+                    clone:PivotTo(cframe * offset:Inverse())
+                else
+                    clone:MoveTo(cframe.Position)
+                end
+            end
+            
+            clone.Parent = exportfolder
+            if count % 15 == 0 then task.wait() end
+        end
+    end
+
+    if synsaveinstance then
+        local ok, err = pcall(function()
+            synsaveinstance({
+                mode = "invalid",
+                ExtraInstances = {exportfolder},
+                IsModel = true,
+                FilePath = exportfolder.Name,
+                SafeMode = false,
+            })
+        end)
+        exportfolder:Destroy()
+        
+        if ok then
+            for _, r in ipairs(state.selected) do removehighlight(r) end
+            table.clear(state.selected)
+            return true
+        end
+    else
+        exportfolder.Parent = workspace
+        for _, r in ipairs(state.selected) do removehighlight(r) end
+        table.clear(state.selected)
+        return true
+    end
+    
+    return false
+end
+
+-- ============================================================================
+-- interface grafica (rayfield)
+-- ============================================================================
+
+local rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local window = rayfield:CreateWindow({
+   Name = "cac ultimate extractor",
+   LoadingTitle = "carregando modulos...",
+   LoadingSubtitle = "por vc",
+   ConfigurationSaving = { Enabled = false },
+   Discord = { Enabled = false },
+   KeySystem = false
+})
+
+-- abas
+local tabmain = window:CreateTab("principal", 4483345998)
+local tabws = window:CreateTab("workspace", 4483345998)
+local tabrs = window:CreateTab("rep storage", 4483345998)
+local tabconfig = window:CreateTab("otimizacao", 4483345998)
+
+-- ================== aba principal ==================
+tabmain:CreateSection("ferramentas de inspecao")
+
+local toggleclick = tabmain:CreateToggle({
+   Name = "ativar modo clique (selecionar na tela)",
+   CurrentValue = false,
+   Flag = "clicktoggle",
+   Callback = function(val)
+        state.clickmode = val
+        if not val and currenthover and not table.find(state.selected, currenthover) then
+            removehighlight(currenthover)
+            currenthover = nil
+        end
+   end,
+})
+
+tabmain:CreateButton({
+   Name = "limpar toda a fila de selecao",
+   Callback = function()
+        for _, r in ipairs(state.selected) do removehighlight(r) end
+        table.clear(state.selected)
+   end,
+})
+
+tabmain:CreateSection("exportacao")
+
+tabmain:CreateButton({
+   Name = "EXPORTAR SELECIONADOS (.RBXMX)",
+   Callback = function()
+        if state.exporting then return end
+        state.exporting = true
+        local okexp, errexp = pcall(exportselected)
+        state.exporting = false
+        if not okexp then warn("[cac] erro no export: " .. tostring(errexp)) end
+   end,
+})
+
+-- ================== descoberta de rigs + selecao em massa ==================
+-- cada lista (src) guarda os rigs do ultimo scan POR REFERENCIA de Instance (nunca por nome).
+-- a fila de export continua sendo state.selected, compartilhada com o modo clique.
+
+local MAXSHOWN = 200            -- maximo de itens no dropdown; Select All continua pegando TODOS os rigs do scan
+local MAXBULKHIGHLIGHTS = 31    -- a engine so renderiza ~31 Highlights ao mesmo tempo, mais que isso e custo sem efeito
+local SCANYIELD = 3000          -- instancias processadas por frame durante o scan (evita travar a UI)
+
+local function notify(title, content)
+    pcall(function()
+        rayfield:Notify({Title = title, Content = content, Duration = 5})
+    end)
+end
+
+local function toset(list)
+    local set = {}
+    for _, v in ipairs(list) do set[v] = true end
+    return set
+end
+
+local function counthighlights()
+    local n = 0
+    for _ in pairs(state.highlights) do n = n + 1 end
+    return n
+end
+
+-- valida o Humanoid achado e devolve o Model-rig, ou nil + motivo da exclusao
+local function validaterig(hum)
+    local model = hum.Parent
+    if not model then
+        return nil, "Humanoid sem parent (destruido durante o scan)"
+    end
+    if not model:IsA("Model") then
+        return nil, "o parent do Humanoid nao e um Model (e " .. model.ClassName .. ")"
+    end
+    if model == lp.Character then
+        return nil, "e o seu proprio personagem"
+    end
+    local anc = model.Parent
+    while anc do
+        if anc:IsA("Folder") and string.find(anc.Name, "^CAC_Extraidos_") then
+            return nil, "dentro de uma pasta de export deste script (CAC_Extraidos_)"
+        end
+        anc = anc.Parent
+    end
+    if not model:FindFirstChildWhichIsA("BasePart", true) then
+        return nil, "sem nenhuma BasePart (nada visual pra exportar)"
+    end
+    return model
+end
+
+-- varre root recursivamente (pastas, models, qualquer container). cada Model com Humanoid direto entra uma vez so.
+local function scanrigs(root)
+    local rigs, seen, skipped = {}, {}, {}
+    local dupes = 0
+    local descendants = root:GetDescendants()
+    for i, obj in ipairs(descendants) do
+        if obj.ClassName == "Humanoid" then
+            local model, reason = validaterig(obj)
+            if model then
+                if seen[model] then
+                    dupes = dupes + 1
+                else
+                    seen[model] = true
+                    table.insert(rigs, model)
+                end
+            else
+                table.insert(skipped, {inst = obj, reason = reason})
+            end
+        end
+        if i % SCANYIELD == 0 then task.wait() end
+    end
+    table.sort(rigs, function(a, b)
+        return string.lower(a.Name) < string.lower(b.Name)
+    end)
+    return rigs, skipped, dupes
+end
+
+local function makesource(title, root)
+    return {
+        title = title, root = root,
+        rigs = {}, set = {},
+        shown = {}, labels = {}, labelmap = {},
+        filter = "", matches = 0,
+        scanning = false, scanned = false,
+        syncing = false, lastkey = "", lastinfo = "",
+    }
+end
+
+local function belongs(src, rig)
+    return src.set[rig] == true or rig:IsDescendantOf(src.root)
+end
+
+local function countselected(src)
+    local k = 0
+    for _, r in ipairs(state.selected) do
+        if belongs(src, r) then k = k + 1 end
+    end
+    return k
+end
+
+local function updateinfo(src)
+    if not src.info then return end
+    local text
+    if not src.scanned then
+        text = "no scan yet - press Refresh List | queue: " .. #state.selected
+    else
+        text = string.format("found: %d | listed: %d | selected here: %d | queue: %d",
+            #src.rigs, #src.shown, countselected(src), #state.selected)
+    end
+    if text ~= src.lastinfo then
+        src.lastinfo = text
+        pcall(function() src.info:Set(text) end)
+    end
+end
+
+-- chave dos itens listados que estao selecionados (usada pra detectar mudanca externa: modo clique, limpar fila, export)
+local function selectedkey(src)
+    local selset = toset(state.selected)
+    local parts = {}
+    for i, rig in ipairs(src.shown) do
+        if selset[rig] then parts[#parts + 1] = i end
+    end
+    return table.concat(parts, ",")
+end
+
+-- alinha o visual do dropdown com state.selected (o callback do dropdown e idempotente, entao Set nao causa loop)
+local function syncdropdown(src)
+    if not src.dropdown then return end
+    local selset = toset(state.selected)
+    local current, parts = {}, {}
+    for i, rig in ipairs(src.shown) do
+        if selset[rig] then
+            table.insert(current, src.labels[i])
+            parts[#parts + 1] = i
+        end
+    end
+    src.lastkey = table.concat(parts, ",")
+    src.syncing = true
+    pcall(function() src.dropdown:Set(current) end)
+    src.syncing = false
+end
+
+-- monta o dropdown a partir do scan + filtro. label unica por rig (#indice), mapeada pra Instance em labelmap
+local function rebuilddropdown(src)
+    local filter = string.lower(src.filter)
+    table.clear(src.shown)
+    table.clear(src.labels)
+    table.clear(src.labelmap)
+    local matches = 0
+    for i, rig in ipairs(src.rigs) do
+        if filter == "" or string.find(string.lower(rig.Name), filter, 1, true) then
+            matches = matches + 1
+            if #src.shown < MAXSHOWN then
+                local parent = rig.Parent
+                local label = string.format("%s  #%d  (%s)", rig.Name, i, parent and parent.Name or "?")
+                table.insert(src.shown, rig)
+                table.insert(src.labels, label)
+                src.labelmap[label] = rig
+            end
+        end
+    end
+    src.matches = matches
+
+    local options = table.clone(src.labels)
+    if #options == 0 then
+        options = {src.scanned and "no rigs match" or "press Refresh List first"}
+    end
+    pcall(function() src.dropdown:Refresh(options) end)
+    syncdropdown(src)
+    updateinfo(src)
+end
+
+-- adiciona a state.selected sem duplicar (O(n) com set, nao O(n^2)); highlight so pra rigs do workspace e ate o limite
+local function addrigs(list)
+    local selset = toset(state.selected)
+    local added = {}
+    for _, rig in ipairs(list) do
+        if not selset[rig] then
+            selset[rig] = true
+            table.insert(state.selected, rig)
+            table.insert(added, rig)
+        end
+    end
+    local used = counthighlights()
+    for _, rig in ipairs(added) do
+        if used >= MAXBULKHIGHLIGHTS then break end
+        if not state.highlights[rig] and rig:IsDescendantOf(workspace) then
+            applyhighlight(rig, selectcolor, 0.6)
+            used = used + 1
+        end
+    end
+    return #added
+end
+
+-- remove de state.selected mantendo a mesma tabela (outras partes do script referenciam state.selected)
+local function removerigs(list)
+    local rm = toset(list)
+    local old = table.clone(state.selected)
+    table.clear(state.selected)
+    local removed = 0
+    for _, rig in ipairs(old) do
+        if rm[rig] then
+            removed = removed + 1
+            removehighlight(rig)
+        else
+            table.insert(state.selected, rig)
+        end
+    end
+    return removed
+end
+
+local function reportskipped(src, skipped, dupes)
+    local groups, order = {}, {}
+    for _, s in ipairs(skipped) do
+        local g = groups[s.reason]
+        if not g then
+            g = {count = 0, examples = {}}
+            groups[s.reason] = g
+            table.insert(order, s.reason)
+        end
+        g.count = g.count + 1
+        if #g.examples < 5 then
+            local ok, path = pcall(function() return s.inst:GetFullName() end)
+            table.insert(g.examples, ok and path or "?")
+        end
+    end
+    for _, reason in ipairs(order) do
+        local g = groups[reason]
+        warn(string.format("[cac] %s: %d Humanoid(s) excluido(s) - %s", src.title, g.count, reason))
+        for _, path in ipairs(g.examples) do
+            print("[cac]    ex: " .. path)
+        end
+    end
+    if dupes > 0 then
+        print(string.format("[cac] %s: %d Humanoid(s) extra no mesmo Model foram unidos (rig contado uma vez)", src.title, dupes))
+    end
+end
+
+local function refreshsource(src)
+    if src.scanning then
+        notify(src.title, "a scan is already running")
+        return
+    end
+    if state.exporting then
+        notify(src.title, "export in progress - wait before refreshing")
+        return
+    end
+    src.scanning = true
+    local ok, rigs, skipped, dupes = pcall(scanrigs, src.root)
+    src.scanning = false
+    if not ok then
+        warn("[cac] scan falhou (" .. src.title .. "): " .. tostring(rigs))
+        notify(src.title, "scan failed - see console")
+        return
+    end
+
+    -- rigs do scan anterior que sumiram (destruidos ou movidos pra fora da raiz) saem da fila, com aviso
+    local stale = {}
+    for rig in pairs(src.set) do
+        if not rig:IsDescendantOf(src.root) then table.insert(stale, rig) end
+    end
+    local pruned = removerigs(stale)
+
+    src.rigs = rigs
+    src.set = toset(rigs)
+    src.scanned = true
+    rebuilddropdown(src)
+    reportskipped(src, skipped, dupes)
+
+    local msg = string.format("%d rigs found, %d excluded", #rigs, #skipped)
+    if #skipped > 0 then msg = msg .. " (reasons in console)" end
+    if pruned > 0 then msg = msg .. string.format(", %d selected rigs no longer exist and were removed from the queue", pruned) end
+    notify(src.title, msg)
+end
+
+local function selectall(src)
+    if state.exporting then
+        notify(src.title, "export in progress - selection is locked")
+        return
+    end
+    if not src.scanned or #src.rigs == 0 then
+        notify(src.title, "nothing to select - press Refresh List first")
+        return
+    end
+    local valid, stale = {}, 0
+    for _, rig in ipairs(src.rigs) do
+        if rig:IsDescendantOf(src.root) then
+            table.insert(valid, rig)
+        else
+            stale = stale + 1
+        end
+    end
+    local added = addrigs(valid)
+    syncdropdown(src)
+    updateinfo(src)
+    local msg = string.format("%d rigs added to the queue (%d were already selected)", added, #valid - added)
+    if stale > 0 then msg = msg .. string.format(", %d no longer exist - press Refresh List", stale) end
+    notify(src.title, msg)
+end
+
+local function deselectall(src)
+    if state.exporting then
+        notify(src.title, "export in progress - selection is locked")
+        return
+    end
+    local list = {}
+    for _, r in ipairs(state.selected) do
+        if belongs(src, r) then table.insert(list, r) end
+    end
+    local removed = removerigs(list)
+    syncdropdown(src)
+    updateinfo(src)
+    notify(src.title, string.format("%d rigs removed from the queue", removed))
+end
+
+local function buildrigtab(tab, src, dropname, dropflag, filterflag)
+    tab:CreateSection(src.title .. " rigs")
+
+    src.info = tab:CreateLabel("no scan yet - press Refresh List")
+
+    tab:CreateButton({
+        Name = "Refresh List (" .. src.title .. ")",
+        Callback = function() refreshsource(src) end,
+    })
+
+    tab:CreateButton({
+        Name = "Select All (" .. src.title .. ")",
+        Callback = function() selectall(src) end,
+    })
+
+    tab:CreateButton({
+        Name = "Deselect All (" .. src.title .. ")",
+        Callback = function() deselectall(src) end,
+    })
+
+    tab:CreateInput({
+        Name = "Filter list by name (optional)",
+        PlaceholderText = "type part of a name",
+        RemoveTextAfterFocusLost = false,
+        Flag = filterflag,
+        Callback = function(text)
+            src.filter = text or ""
+            if src.scanned then rebuilddropdown(src) end
+        end,
+    })
+
+    src.dropdown = tab:CreateDropdown({
+        Name = dropname,
+        Options = {"press Refresh List first"},
+        CurrentOption = {""},
+        MultipleOptions = true,
+        Flag = dropflag,
+        Callback = function(options)
+            if src.syncing or state.exporting then return end
+            if type(options) == "string" then options = {options} end
+            local want = {}
+            for _, label in ipairs(options) do
+                local rig = src.labelmap[label]
+                if rig then want[rig] = true end
+            end
+            -- so reconcilia os itens listados; rigs fora do dropdown (limite/filtro) nao sao tocados
+            local selset = toset(state.selected)
+            local toadd, toremove = {}, {}
+            for _, rig in ipairs(src.shown) do
+                if want[rig] and not selset[rig] then
+                    table.insert(toadd, rig)
+                elseif not want[rig] and selset[rig] then
+                    table.insert(toremove, rig)
+                end
+            end
+            addrigs(toadd)
+            removerigs(toremove)
+            src.lastkey = selectedkey(src)
+            updateinfo(src)
+        end,
+    })
+end
+
+local wssrc = makesource("Workspace", workspace)
+local rssrc = makesource("ReplicatedStorage", repstorage)
+
+-- ================== aba workspace ==================
+buildrigtab(tabws, wssrc, "selecionar rigs do workspace", "wsdrop", "wsfilter")
+
+-- ================== aba replicated storage ==================
+buildrigtab(tabrs, rssrc, "selecionar rigs do rep. storage", "rsdrop", "rsfilter")
+
+-- mantem contadores e dropdowns alinhados com mudancas externas na fila (modo clique, limpar fila, export)
+task.spawn(function()
+    local sources = {wssrc, rssrc}
+    while true do
+        task.wait(1)
+        for _, src in ipairs(sources) do
+            if src.scanned and not src.scanning and #src.shown > 0 and selectedkey(src) ~= src.lastkey then
+                syncdropdown(src)
+            end
+            updateinfo(src)
+        end
+    end
+end)
+
+-- ================== aba otimizacao ==================
+tabconfig:CreateSection("culling de renderizacao (fps boost)")
+
+tabconfig:CreateToggle({
+   Name = "esconder rigs distantes",
+   CurrentValue = false,
+   Flag = "culltoggle",
+   Callback = function(val)
+        state.culling = val
+        if not val then
+            -- restaura todos se desativar
+            for _, obj in ipairs(workspace:GetDescendants()) do
+                if isrig(obj) then
+                    for _, part in ipairs(obj:GetDescendants()) do
+                        if part:IsA("BasePart") or part:IsA("Decal") or part:IsA("Texture") then
+                            part.LocalTransparencyModifier = 0
+                        end
+                    end
+                end
+            end
+        end
+   end,
+})
+
+tabconfig:CreateSlider({
+   Name = "distancia de renderizacao",
+   Range = {20, 1000},
+   Increment = 10,
+   Suffix = "studs",
+   CurrentValue = 150,
+   Flag = "distantslider",
+   Callback = function(val)
+        state.renderdist = val
+   end,
+})
